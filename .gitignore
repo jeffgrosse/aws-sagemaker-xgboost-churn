@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+venv/
+.venv/
+env/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# SAM / CloudFormation build artifacts
+.aws-sam/
+packaged.yaml
+samconfig.toml
+samconfig.toml.local
+
+# Data - fetched by scripts/download_data.sh, not committed
+data/
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

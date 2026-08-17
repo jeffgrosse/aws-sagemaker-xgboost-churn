@@ -1,0 +1,23 @@
+# Local pipeline (data prep, training-job driver, evaluation) and test tooling.
+# The predict Lambda has its own requirements.txt (src/predict_lambda/) - it
+# depends only on boto3, which ships with the Lambda runtime, so nothing here
+# gets deployed. This file is for your machine, not for AWS.
+
+pytest
+
+pandas
+scikit-learn
+
+# Pinned to match the SageMaker built-in XGBoost 1.7-1 container's native XGBoost
+# version, so the booster evaluate.py loads locally is byte-for-byte the same
+# format the training container wrote. See docs/ARCHITECTURE.md#xgboost-version-pin.
+xgboost==1.7.6
+
+# v2 SDK, pinned below v3 deliberately - see docs/ARCHITECTURE.md#sdk-v3-gotcha.
+# `pip install sagemaker` with no version pin gets you v3 today: a ground-up
+# rewrite (sagemaker.train / sagemaker.core / sagemaker.serve / sagemaker.mlops)
+# with none of the classic sagemaker.estimator.Estimator / sagemaker.image_uris
+# API every existing tutorial, and this repo's scripts, are written against.
+sagemaker>=2.257,<3
+
+boto3

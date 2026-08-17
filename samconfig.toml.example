@@ -1,0 +1,12 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "aws-sagemaker-xgboost-churn"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+# ModelDataUrl and ImageUri have no usable default - both come from a
+# completed `make train` run (also saved to data/last_training_run.json,
+# which `make deploy` reads automatically if you don't override these).
+parameter_overrides = "ModelDataUrl=\"s3://REPLACE-ME/model.tar.gz\" ImageUri=\"REPLACE-ME.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1\" AllowedOrigin=\"https://example.com\""

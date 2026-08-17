@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SageMaker Serverless Inference endpoint for the Telco churn XGBoost model,
+  fronted by an API Gateway HTTP API + Lambda. Deploys the inference side
+  only - training is script-driven (scripts/train.py), not CloudFormation;
+  see docs/ARCHITECTURE.md#cfn-vs-script-split for why. Requires ModelDataUrl
+  and ImageUri from a completed `make train` run (both are printed at the
+  end of scripts/train.py, and saved to data/last_training_run.json).
+
+Parameters:
+  ModelDataUrl:
+    Type: String
+    AllowedPattern: ^s3://.+
+    Description: >
+      S3 URI of the trained model artifact (model.tar.gz), printed by
+      scripts/train.py.
+
+  ImageUri:
+    Type: String
+    Description: >
+      SageMaker built-in XGBoost container image URI for your region,
+      resolved by scripts/train.py via sagemaker.image_uris.retrieve() -
+      not hardcoded here since AWS retired the static per-region registry
+      docs this template would otherwise need to embed (see
+      docs/ARCHITECTURE.md#image-uri-resolution).
+
+  ServerlessMemorySizeInMB:
+    Type: Number
+    Default: 2048
+    AllowedValues: [1024, 2048, 3072, 4096, 5120, 6144]
+    Description: >
+      Serverless Inference memory allocation. 2048 MB is comfortably above
+      what a single-model XGBoost booster on ~30 tabular features needs.
+
+  ServerlessMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 200
+    Description: Max concurrent serverless endpoint invocations.
+
+  ChurnThreshold:
+    Type: Number
+    Default: 0.5
+    Description: Probability threshold above which the predict Lambda labels a customer "Yes" (churn).
+
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: >
+      CORS origin allowed to call the predict API. Override to your actual
+      demo page's origin before using this beyond local testing - see README.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 10
+    Architectures: [x86_64]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # SageMaker hosting: Model / EndpointConfig (serverless) / Endpoint
+  # ---------------------------------------------------------------------------
+
+  SageMakerHostingExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-model-artifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - arn:aws:s3:::${Bucket}/*
+                  - Bucket: !Select [2, !Split ['/', !Ref ModelDataUrl]]
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Endpoints/${AWS::StackName}-endpoint:*
+
+  SageMakerModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerHostingExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Ref ImageUri
+        ModelDataUrl: !Ref ModelDataUrl
+
+  SageMakerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt SageMakerModel.ModelName
+          ServerlessConfig:
+            MemorySizeInMB: !Ref ServerlessMemorySizeInMB
+            MaxConcurrency: !Ref ServerlessMaxConcurrency
+
+  # EndpointName is set explicitly (rather than left to CFN's generated
+  # physical ID) so the same value can be referenced by name in the Lambda's
+  # environment variable and in its IAM policy's Resource ARN below, without
+  # depending on AWS::SageMaker::Endpoint exposing it as a GetAtt attribute.
+  SageMakerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Sub ${AWS::StackName}-endpoint
+      EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName
+
+  # ---------------------------------------------------------------------------
+  # Predict: HTTP API + Lambda
+  # ---------------------------------------------------------------------------
+
+  PredictApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [content-type]
+
+  PredictFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: predict_lambda.app.lambda_handler
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Sub ${AWS::StackName}-endpoint
+          CHURN_THRESHOLD: !Ref ChurnThreshold
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: sagemaker:InvokeEndpoint
+              Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${AWS::StackName}-endpoint
+      Events:
+        PredictRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PredictApi
+            Path: /predict
+            Method: post
+    DependsOn: SageMakerEndpoint
+
+  PredictFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PredictFunction}
+      RetentionInDays: 90
+
+Outputs:
+  PredictApiUrl:
+    Description: Invoke URL for the predict endpoint (POST /predict).
+    Value: !Sub https://${PredictApi}.execute-api.${AWS::Region}.amazonaws.com/predict
+  EndpointName:
+    Description: SageMaker Serverless Inference endpoint name.
+    Value: !Sub ${AWS::StackName}-endpoint
+  ModelName:
+    Value: !GetAtt SageMakerModel.ModelName

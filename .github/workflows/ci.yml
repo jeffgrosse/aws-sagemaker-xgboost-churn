@@ -1,0 +1,61 @@
+name: CI
+
+# Runs on every PR (any branch -> main) and on push to main. Needs zero AWS
+# credentials - every check here is static (sam validate/build) or exercises
+# pure functions / mocked boto3 clients (pytest). No training job runs here
+# (that's billed, and belongs in `make train`, run locally); no `sam deploy`
+# either - changesets stay a manual, reviewed step.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# boto3 clients constructed at module-import time (src/predict_lambda/app.py)
+# need a region set - locally that comes from ~/.aws/config, which
+# GitHub-hosted runners don't have. This satisfies boto3's region requirement
+# without needing credentials; tests mock the actual invoke_endpoint call.
+env:
+  AWS_DEFAULT_REGION: us-east-1
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Pinned, not "latest": deploys (when run manually) use this same SAM
+      # CLI version locally - keeping CI pinned avoids "works in CI, breaks
+      # on deploy" (or vice versa) from a SAM CLI version drift.
+      - uses: aws-actions/setup-sam@v2
+        with:
+          version: 1.162.1
+
+      # Static, no dependency install needed - fails in seconds if the
+      # template itself is broken, before spending time on the heavier
+      # steps below.
+      - name: sam validate --lint
+        run: sam validate --lint
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: pytest
+        run: pytest tests/ -v
+
+      # Confirms the predict Lambda still packages cleanly (dependency
+      # resolution, CodeUri layout) - catches issues sam validate's
+      # template-only check can't see. Deliberately stops here: no sam
+      # deploy in this workflow, ever.
+      - name: sam build
+        run: sam build

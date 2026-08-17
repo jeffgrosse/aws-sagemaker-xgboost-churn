@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sagemaker-xgboost-churn"
+version = "0.1.0"
+description = "SageMaker built-in XGBoost churn model: training job, serverless endpoint, and predict API."
+requires-python = ">=3.12"
+dependencies = []
+
+# src/ is both the deployment root SAM zips up for the predict Lambda (see
+# template.yaml's CodeUri) and the shared feature-encoding module scripts/ imports -
+# one import statement ("from churn_features import ...") resolves identically for a
+# deployed Lambda, for scripts/, and for pytest. Run `pip install -e .` once to make
+# this resolve locally.
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["churn_features"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
