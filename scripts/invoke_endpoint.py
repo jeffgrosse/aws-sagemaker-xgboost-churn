@@ -37,8 +37,13 @@ SAMPLE_CUSTOMER = {
 }
 
 
-def resolve_api_url(stack_name):
-    cfn = boto3.client("cloudformation")
+def resolve_api_url(stack_name, region):
+    # Region passed explicitly rather than left to boto3's ambient default -
+    # see the same fix in scripts/train.py and scripts/bootstrap_training_role.sh
+    # for why relying on the CLI profile's default region is a real footgun
+    # here (this exact command failed with "stack does not exist" against
+    # the wrong region the first time, for that reason).
+    cfn = boto3.client("cloudformation", region_name=region)
     outputs = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
     for output in outputs:
         if output["OutputKey"] == "PredictApiUrl":
@@ -50,9 +55,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", default=None)
     parser.add_argument("--stack-name", default="aws-sagemaker-xgboost-churn")
+    parser.add_argument("--region", default="us-east-1", help="Must match the region the stack was deployed to")
     args = parser.parse_args()
 
-    api_url = args.api_url or resolve_api_url(args.stack_name)
+    api_url = args.api_url or resolve_api_url(args.stack_name, args.region)
 
     request = urllib.request.Request(
         api_url,

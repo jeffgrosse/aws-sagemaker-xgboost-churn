@@ -24,8 +24,22 @@ flowchart LR
 
 ## Gotchas
 
-Three real ones hit while building this - each is documented in more detail,
+Four real ones hit while building this - each is documented in more detail,
 with a permanent anchor, in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+**Nothing in this repo trusts your CLI profile's default region - it cost real time to learn why.**
+`boto3.Session()` with no explicit region silently falls back to your AWS
+CLI profile's configured default. On the machine this was built on, that
+default didn't match the region the training quota was requested in or the
+region the stack was deployed to - three separate scripts (`train.py`,
+`bootstrap_training_role.sh`, `invoke_endpoint.py`) each independently hit
+a confusing failure (`ResourceLimitExceeded` against the wrong region's
+zero quota, an IAM policy scoped to the wrong region's S3 bucket, "stack
+does not exist") before the actual root cause - one ambient default,
+silently different from what the project assumes - became obvious. Every
+script here now defaults to `us-east-1` explicitly rather than inheriting
+whatever your profile happens to be set to. See
+[docs/ARCHITECTURE.md#region-default-footgun](docs/ARCHITECTURE.md#region-default-footgun).
 
 **`pip install sagemaker` installs a different SDK than every tutorial expects.**
 As of this writing, an unpinned install gets you SageMaker Python SDK **v3**
@@ -105,19 +119,26 @@ Computed by `scripts/evaluate.py` against `data/processed/test.csv` - a
 15% stratified split the model never saw during training or early stopping.
 Written to [docs/evaluation-metrics.json](docs/evaluation-metrics.json).
 
+Test set: 1,057 held-out customers (26.58% churn rate).
+
 | Metric | Model | Majority-class baseline |
 |---|---|---|
-| Accuracy | _pending real training run_ | _pending_ |
-| Precision | _pending_ | _pending_ |
-| Recall | _pending_ | _pending_ |
-| AUC | _pending_ | _pending_ |
+| Accuracy | **0.7550** | 0.7342 |
+| Precision | **0.5267** | 0.0000 |
+| Recall | **0.7722** | 0.0000 |
+| AUC | **0.8374** | 0.5000 |
 
-The baseline always predicts "No churn" (the majority class, ~73.5% of
-customers) - it posts a deceptively high accuracy for doing nothing, but
-0% recall: it never catches a single churner, which is the entire point of
-building this model in the first place. `train.py` weights the minority
-(churn) class via `scale_pos_weight`, trading some of that free accuracy for
-real recall - see
+The baseline always predicts "No churn" (the majority class, ~73.4% of the
+test set) - it posts a deceptively high 73.4% accuracy for doing nothing,
+but 0% recall: it never catches a single churner, which is the entire point
+of building this model in the first place. The trained model trades a small
+amount of that free accuracy (75.5% vs. 73.4%) for real signal: an AUC of
+0.84 and 77% recall on churners, meaning it correctly flags roughly 3 out
+of every 4 customers who actually churn - the metric that matters for a
+churn model, not accuracy on its own. `train.py` weights the minority
+(churn) class via `scale_pos_weight`, which is what pushes recall up at
+some cost to precision (0.53 - just over half of predicted churners are
+real churners) - see
 [docs/ARCHITECTURE.md#class-imbalance-scale_pos_weight](docs/ARCHITECTURE.md#class-imbalance-scale_pos_weight).
 
 ## Live demo
@@ -133,15 +154,26 @@ curl -X POST https://YOUR-API-ID.execute-api.YOUR-REGION.amazonaws.com/predict \
     "StreamingTV": "Yes", "StreamingMovies": "Yes", "Contract": "Month-to-month",
     "PaperlessBilling": "Yes", "PaymentMethod": "Electronic check"
   }'
-# {"churn_probability": 0.73, "churn_label": "Yes"}
+# {"churn_probability": 0.8638, "churn_label": "Yes"}
 ```
 
+Real response from the live endpoint. A low-risk profile (65-month tenure,
+two-year contract, DSL, low monthly charges) comes back at
+`{"churn_probability": 0.0438, "churn_label": "No"}` from the same
+endpoint - the model is discriminating on real signal, not returning a
+constant.
+
 Or `python3 scripts/invoke_endpoint.py --stack-name aws-sagemaker-xgboost-churn`,
-which does the same thing and checks the response shape. Expect a
-several-second cold start on the first request after a period of no
-traffic - normal, expected behavior for Serverless Inference, not a bug (the
-same latency trade-off already accepted by the Bedrock "ask your data" demo
-on prediktsales.com).
+which does the same thing and checks the response shape. Expect an
+occasional cold start on the first request after a period of no traffic -
+normal, expected behavior for Serverless Inference, not a bug (the same
+latency trade-off already accepted by the Bedrock "ask your data" demo on
+prediktsales.com). In practice this can surface as a `ModelError` from the
+endpoint rather than just extra latency - confirmed directly against the
+live endpoint while building this (the container hadn't logged the request
+at all when it happened). `src/predict_lambda/app.py` retries once after a
+short delay specifically for that error before giving up, which is
+transparent to the caller in every case seen so far.
 
 A browsable demo page (same spirit as the Bedrock guardrails demo) is
 planned as a follow-up addition to prediktsales.com, calling this repo's

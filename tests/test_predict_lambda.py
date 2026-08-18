@@ -1,6 +1,8 @@
 import json
 from unittest.mock import MagicMock
 
+from botocore.exceptions import ClientError
+
 from churn_features import FEATURE_COLUMNS
 
 VALID_CUSTOMER = {
@@ -88,6 +90,55 @@ def test_missing_field_returns_400_without_calling_endpoint(predict_app):
 def test_invalid_json_body_returns_400(predict_app):
     response = predict_app.lambda_handler({"body": "{not json"}, None)
     assert response["statusCode"] == 400
+
+
+def _model_error():
+    return ClientError(
+        {"Error": {"Code": "ModelError", "Message": "Received server error (0) from model"}},
+        "InvokeEndpoint",
+    )
+
+
+def test_model_error_retries_once_and_succeeds(predict_app, monkeypatch):
+    # First call raises the exact error observed from a real Serverless
+    # Inference cold start; second call succeeds.
+    fake_body = MagicMock()
+    fake_body.read.return_value = b"0.6"
+    predict_app.runtime = MagicMock()
+    predict_app.runtime.invoke_endpoint.side_effect = [_model_error(), {"Body": fake_body}]
+    monkeypatch.setattr(predict_app.time, "sleep", lambda seconds: None)
+
+    response = predict_app.lambda_handler(_event(VALID_CUSTOMER), None)
+    body = json.loads(response["body"])
+
+    assert response["statusCode"] == 200
+    assert body["churn_probability"] == 0.6
+    assert predict_app.runtime.invoke_endpoint.call_count == 2
+
+
+def test_model_error_twice_returns_502(predict_app, monkeypatch):
+    predict_app.runtime = MagicMock()
+    predict_app.runtime.invoke_endpoint.side_effect = [_model_error(), _model_error()]
+    monkeypatch.setattr(predict_app.time, "sleep", lambda seconds: None)
+
+    response = predict_app.lambda_handler(_event(VALID_CUSTOMER), None)
+
+    assert response["statusCode"] == 502
+    assert predict_app.runtime.invoke_endpoint.call_count == 2
+
+
+def test_non_model_error_client_error_is_not_retried(predict_app):
+    throttling_error = ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+        "InvokeEndpoint",
+    )
+    predict_app.runtime = MagicMock()
+    predict_app.runtime.invoke_endpoint.side_effect = throttling_error
+
+    response = predict_app.lambda_handler(_event(VALID_CUSTOMER), None)
+
+    assert response["statusCode"] == 502
+    assert predict_app.runtime.invoke_endpoint.call_count == 1
 
 
 def test_endpoint_invocation_failure_returns_502_without_leaking_detail(predict_app):
