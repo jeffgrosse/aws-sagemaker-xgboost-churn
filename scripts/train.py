@@ -72,7 +72,14 @@ def read_training_labels(train_csv_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role-arn", required=True, help="SageMaker execution role ARN (see scripts/bootstrap_training_role.sh)")
-    parser.add_argument("--region", default=None, help="Defaults to the boto3 session's configured region")
+    # Deliberately not left to default to boto3's ambient session region -
+    # that reads your CLI profile's default, which has no reason to match
+    # where you actually want to train and, on this project's first run,
+    # silently pointed a real CreateTrainingJob call at the wrong region's
+    # (also zero-quota) account limits. us-east-1 matches template.yaml /
+    # samconfig.toml.example / scripts/bootstrap_training_role.sh's default -
+    # override consistently across all three if you deploy elsewhere.
+    parser.add_argument("--region", default="us-east-1", help="Must match the region scripts/bootstrap_training_role.sh's policy was scoped to")
     parser.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE)
     parser.add_argument("--xgboost-version", default=DEFAULT_XGBOOST_VERSION)
     parser.add_argument("--num-round", type=int, default=DEFAULT_NUM_ROUND)

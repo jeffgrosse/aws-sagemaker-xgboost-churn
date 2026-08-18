@@ -9,8 +9,10 @@ a CSV row, and returns a churn probability.
 import json
 import logging
 import os
+import time
 
 import boto3
+from botocore.exceptions import ClientError
 
 from churn_features import REQUIRED_FIELDS, encode_record
 
@@ -22,6 +24,8 @@ runtime = boto3.client("sagemaker-runtime")
 ENDPOINT_NAME = os.environ["ENDPOINT_NAME"]
 CHURN_THRESHOLD = float(os.environ.get("CHURN_THRESHOLD", "0.5"))
 
+COLD_START_RETRY_DELAY_SECONDS = 2
+
 
 def _response(status_code, body_dict):
     return {
@@ -29,6 +33,27 @@ def _response(status_code, body_dict):
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps(body_dict),
     }
+
+
+def _invoke_endpoint(csv_row):
+    """SageMaker Serverless Inference can return a ModelError ("could not
+    get a response from the endpoint") on the first request after a period
+    of no traffic, while a fresh container is still starting - observed
+    directly while building this (confirmed via the endpoint's own
+    CloudWatch logs: the container hadn't even logged a request attempt for
+    the failed call). One retry after a short delay is enough in practice -
+    a second cold start back to back within the same request is unusual.
+    Any other error (bad input already validated earlier, throttling,
+    genuine service failure) is not retried here and propagates to the
+    caller's generic 502 handling."""
+    try:
+        return runtime.invoke_endpoint(EndpointName=ENDPOINT_NAME, ContentType="text/csv", Body=csv_row)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ModelError":
+            raise
+        logger.warning("ModelError from %s (likely a Serverless Inference cold start) - retrying once", ENDPOINT_NAME)
+        time.sleep(COLD_START_RETRY_DELAY_SECONDS)
+        return runtime.invoke_endpoint(EndpointName=ENDPOINT_NAME, ContentType="text/csv", Body=csv_row)
 
 
 def lambda_handler(event, context):
@@ -49,11 +74,7 @@ def lambda_handler(event, context):
     csv_row = ",".join(str(value) for value in feature_vector)
 
     try:
-        endpoint_response = runtime.invoke_endpoint(
-            EndpointName=ENDPOINT_NAME,
-            ContentType="text/csv",
-            Body=csv_row,
-        )
+        endpoint_response = _invoke_endpoint(csv_row)
         prediction = endpoint_response["Body"].read().decode("utf-8").strip()
         churn_probability = float(prediction)
     except Exception:

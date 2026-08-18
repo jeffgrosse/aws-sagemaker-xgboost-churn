@@ -141,6 +141,52 @@ can auto-approve in minutes or take up to ~24h for manual review depending
 on account history. Budget for that lead time before your first `make train`
 if you're setting this up in a fresh account.
 
+## `region-default-footgun`
+
+`boto3.Session()` with no explicit `region_name` resolves to your AWS CLI
+profile's configured default region - not to any region this project
+documents or assumes. That default has no reason to match the region you
+actually want to train and deploy into, and when it doesn't, the failures
+it produces don't look like a region problem:
+
+- `scripts/train.py` (before this was fixed) submitted `CreateTrainingJob`
+  against the profile's default region, which had its own (also zero)
+  training-job quota - indistinguishable from the real quota-zero problem
+  until checked directly, since the error message is identical either way.
+- `scripts/bootstrap_training_role.sh` (before this was fixed) computed the
+  training role's S3 policy against `$(aws configure get region)` - the
+  role ended up scoped to the wrong region's default bucket ARN entirely,
+  which only surfaced once training itself pointed at the *correct* region
+  and got an access-denied `s3:ListBucket` failure that looked like an IAM
+  policy bug, not a region mismatch.
+- `scripts/invoke_endpoint.py` (before this was fixed) constructed an
+  unregioned `boto3.client("cloudformation")` and failed with "Stack ...
+  does not exist" against a stack that was very much deployed - just not in
+  the region being queried.
+
+All three now default to `us-east-1` explicitly (matching
+`template.yaml` / `samconfig.toml.example`) instead of inheriting an
+ambient CLI default. The general lesson: any script in this repo that talks
+to AWS takes `--region` explicitly and defaults it to a value this project
+controls, never to whatever a user's local profile happens to be set to -
+a profile default is a reasonable convenience for ad hoc CLI use, and a
+real correctness hazard for a script other people will run against their
+own, differently-configured accounts.
+
+## `cold-start-retry`
+
+Confirmed directly against the live endpoint: a request during a genuine
+Serverless Inference cold start doesn't always just add latency - it can
+come back as a `ModelError` ("Amazon SageMaker could not get a response
+from the ... endpoint"), and the endpoint's own CloudWatch log group
+(`/aws/sagemaker/Endpoints/<name>`) shows no record of the request ever
+reaching the container for that attempt. `src/predict_lambda/app.py`'s
+`_invoke_endpoint()` catches specifically that error code, sleeps briefly,
+and retries once before giving up - every cold start hit while testing this
+resolved on the retry. `template.yaml`'s Lambda `Timeout` (20s) was raised
+from SAM's usual default specifically to leave room for this retry path
+without the Lambda itself timing out first.
+
 ## Cost model
 
 SageMaker Serverless Inference bills per-millisecond of actual invocation

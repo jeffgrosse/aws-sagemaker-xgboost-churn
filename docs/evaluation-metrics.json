@@ -1,0 +1,17 @@
+{
+  "test_set_size": 1057,
+  "test_set_churn_rate": 0.2658,
+  "model": {
+    "accuracy": 0.755,
+    "precision": 0.5267,
+    "recall": 0.7722,
+    "auc": 0.8374
+  },
+  "baseline": {
+    "predicts": "No",
+    "accuracy": 0.7342,
+    "precision": 0.0,
+    "recall": 0.0,
+    "auc": 0.5
+  }
+}

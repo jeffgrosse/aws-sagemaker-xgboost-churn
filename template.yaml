@@ -56,7 +56,11 @@ Globals:
   Function:
     Runtime: python3.12
     MemorySize: 256
-    Timeout: 10
+    # 20s, not the default 3s/10s: leaves headroom for _invoke_endpoint's
+    # one-retry-after-a-cold-start-ModelError path in
+    # src/predict_lambda/app.py (2s sleep + up to two real endpoint round
+    # trips) without the Lambda itself timing out first.
+    Timeout: 20
     Architectures: [x86_64]
 
 Resources:
