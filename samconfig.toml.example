@@ -9,4 +9,8 @@ resolve_s3 = true
 # ModelDataUrl and ImageUri have no usable default - both come from a
 # completed `make train` run (also saved to data/last_training_run.json,
 # which `make deploy` reads automatically if you don't override these).
-parameter_overrides = "ModelDataUrl=\"s3://REPLACE-ME/model.tar.gz\" ImageUri=\"REPLACE-ME.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1\" AllowedOrigin=\"https://example.com\""
+# ApiKeyValue also has no default and is required - generate one with
+# `openssl rand -hex 24`; every caller must send it back as X-Api-Key
+# (see docs/ARCHITECTURE.md#api-key-not-usage-plan for why this exists
+# instead of a real API Gateway usage plan).
+parameter_overrides = "ModelDataUrl=\"s3://REPLACE-ME/model.tar.gz\" ImageUri=\"REPLACE-ME.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1\" AllowedOrigin=\"https://example.com\" ApiKeyValue=\"REPLACE-ME-with-openssl-rand-hex-24\""

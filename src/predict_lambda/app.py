@@ -1,11 +1,14 @@
 """API Gateway -> Lambda -> SageMaker Serverless Inference endpoint.
 
-Takes a JSON customer record, encodes it with churn_features.encode_record
-(the exact same function used at training time - see churn_features.py's
-module docstring for why that matters), invokes the deployed endpoint with
-a CSV row, and returns a churn probability.
+Requires a valid X-Api-Key header (checked against API_KEY_VALUE) before
+doing anything else - see _authorized() below. Takes a JSON customer
+record, encodes it with churn_features.encode_record (the exact same
+function used at training time - see churn_features.py's module docstring
+for why that matters), invokes the deployed endpoint with a CSV row, and
+returns a churn probability.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -23,6 +26,7 @@ runtime = boto3.client("sagemaker-runtime")
 
 ENDPOINT_NAME = os.environ["ENDPOINT_NAME"]
 CHURN_THRESHOLD = float(os.environ.get("CHURN_THRESHOLD", "0.5"))
+API_KEY_VALUE = os.environ["API_KEY_VALUE"]
 
 COLD_START_RETRY_DELAY_SECONDS = 2
 
@@ -33,6 +37,18 @@ def _response(status_code, body_dict):
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps(body_dict),
     }
+
+
+def _authorized(event):
+    # HTTP APIs have no native API key/usage plan feature (REST-API-only -
+    # see docs/ARCHITECTURE.md#api-key-not-usage-plan), so this is a
+    # hand-checked shared secret instead. hmac.compare_digest, not == , for
+    # the same timing-attack reason as aws-serverless-signed-unsubscribe's
+    # signature comparison - a wrong key should take the same time to
+    # reject regardless of how many leading characters happen to match.
+    headers = event.get("headers") or {}
+    provided_key = headers.get("x-api-key", "")
+    return hmac.compare_digest(provided_key, API_KEY_VALUE)
 
 
 def _invoke_endpoint(csv_row):
@@ -57,6 +73,9 @@ def _invoke_endpoint(csv_row):
 
 
 def lambda_handler(event, context):
+    if not _authorized(event):
+        return _response(401, {"error": "Missing or invalid X-Api-Key header."})
+
     try:
         raw_body = event.get("body") or "{}"
         customer = json.loads(raw_body)

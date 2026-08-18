@@ -3,12 +3,16 @@
 prediction comes back through the full chain (API Gateway -> Lambda ->
 SageMaker Serverless endpoint -> response).
 
-    python3 scripts/invoke_endpoint.py --stack-name aws-sagemaker-xgboost-churn
-    python3 scripts/invoke_endpoint.py --api-url https://abc123.execute-api.us-east-1.amazonaws.com/predict
+    python3 scripts/invoke_endpoint.py --stack-name aws-sagemaker-xgboost-churn --api-key YOUR_KEY
+    python3 scripts/invoke_endpoint.py --api-url https://abc123.execute-api.us-east-1.amazonaws.com/predict --api-key YOUR_KEY
+
+--api-key must match the ApiKeyValue the stack was deployed with (or set
+PREDICT_API_KEY instead of passing it every time).
 """
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
 
@@ -55,15 +59,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", default=None)
     parser.add_argument("--stack-name", default="aws-sagemaker-xgboost-churn")
-    parser.add_argument("--region", default="us-east-1", help="Must match the region the stack was deployed to")
+    # Falls back to AWS_DEFAULT_REGION, then "us-east-1" - matching
+    # scripts/train.py and scripts/bootstrap_training_role.sh's fallback
+    # chain exactly (see docs/ARCHITECTURE.md#region-default-footgun).
+    parser.add_argument(
+        "--region",
+        default=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        help="Must match the region the stack was deployed to",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("PREDICT_API_KEY"),
+        help="Value of the ApiKeyValue template parameter the stack was deployed with; can also be set via PREDICT_API_KEY",
+    )
     args = parser.parse_args()
+
+    if not args.api_key:
+        sys.exit("Missing API key - pass --api-key or set PREDICT_API_KEY (the ApiKeyValue you deployed with).")
 
     api_url = args.api_url or resolve_api_url(args.stack_name, args.region)
 
     request = urllib.request.Request(
         api_url,
         data=json.dumps(SAMPLE_CUSTOMER).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Api-Key": args.api_key},
         method="POST",
     )
 
