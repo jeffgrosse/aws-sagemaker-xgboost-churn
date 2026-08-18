@@ -1,6 +1,7 @@
 {
   "test_set_size": 1057,
   "test_set_churn_rate": 0.2658,
+  "threshold": 0.5,
   "model": {
     "accuracy": 0.755,
     "precision": 0.5267,

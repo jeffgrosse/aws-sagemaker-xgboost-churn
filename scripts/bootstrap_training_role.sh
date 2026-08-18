@@ -23,6 +23,11 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 # genuinely train elsewhere, and pass the same region to scripts/train.py.
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 BUCKET_ARN="arn:aws:s3:::sagemaker-${REGION}-${ACCOUNT_ID}"
+# Must match scripts/train.py's S3_PREFIX constant and template.yaml's
+# hosting-role policy - scoping to this project's own prefix within the
+# shared default bucket, not the whole bucket (which would also cover any
+# other project's training data/artifacts in the same account/region).
+S3_PREFIX="aws-sagemaker-xgboost-churn"
 
 if aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1; then
   echo "Role ${ROLE_NAME} already exists - skipping creation, refreshing its policy."
@@ -55,17 +60,20 @@ aws iam put-role-policy \
       {
         \"Effect\": \"Allow\",
         \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
-        \"Resource\": \"${BUCKET_ARN}/*\"
+        \"Resource\": \"${BUCKET_ARN}/${S3_PREFIX}/*\"
       },
       {
         \"Effect\": \"Allow\",
         \"Action\": \"s3:ListBucket\",
-        \"Resource\": \"${BUCKET_ARN}\"
+        \"Resource\": \"${BUCKET_ARN}\",
+        \"Condition\": {
+          \"StringLike\": {\"s3:prefix\": [\"${S3_PREFIX}/*\"]}
+        }
       },
       {
         \"Effect\": \"Allow\",
         \"Action\": [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"],
-        \"Resource\": \"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/sagemaker/*\"
+        \"Resource\": \"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/sagemaker/TrainingJobs:*\"
       }
     ]
   }" >/dev/null

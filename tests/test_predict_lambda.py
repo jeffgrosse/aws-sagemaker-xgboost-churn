@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 from botocore.exceptions import ClientError
 
 from churn_features import FEATURE_COLUMNS
+from conftest import API_KEY_VALUE
 
 VALID_CUSTOMER = {
     "SeniorCitizen": 0,
@@ -28,8 +29,11 @@ VALID_CUSTOMER = {
 }
 
 
-def _event(body_dict):
-    return {"body": json.dumps(body_dict)}
+def _event(body_dict, api_key=API_KEY_VALUE):
+    event = {"body": json.dumps(body_dict)}
+    if api_key is not None:
+        event["headers"] = {"x-api-key": api_key}
+    return event
 
 
 def _mock_invoke_endpoint(predict_app, probability_string):
@@ -88,8 +92,31 @@ def test_missing_field_returns_400_without_calling_endpoint(predict_app):
 
 
 def test_invalid_json_body_returns_400(predict_app):
-    response = predict_app.lambda_handler({"body": "{not json"}, None)
+    response = predict_app.lambda_handler({"body": "{not json", "headers": {"x-api-key": API_KEY_VALUE}}, None)
     assert response["statusCode"] == 400
+
+
+def test_missing_api_key_returns_401_without_calling_endpoint(predict_app):
+    runtime = _mock_invoke_endpoint(predict_app, "0.5")
+    response = predict_app.lambda_handler(_event(VALID_CUSTOMER, api_key=None), None)
+
+    assert response["statusCode"] == 401
+    runtime.invoke_endpoint.assert_not_called()
+
+
+def test_wrong_api_key_returns_401_without_calling_endpoint(predict_app):
+    runtime = _mock_invoke_endpoint(predict_app, "0.5")
+    response = predict_app.lambda_handler(_event(VALID_CUSTOMER, api_key="wrong-key"), None)
+
+    assert response["statusCode"] == 401
+    runtime.invoke_endpoint.assert_not_called()
+
+
+def test_missing_headers_key_entirely_returns_401(predict_app):
+    # No "headers" key at all in the event (vs. headers present but without
+    # x-api-key) - a slightly different shape, same rejection.
+    response = predict_app.lambda_handler({"body": json.dumps(VALID_CUSTOMER)}, None)
+    assert response["statusCode"] == 401
 
 
 def _model_error():

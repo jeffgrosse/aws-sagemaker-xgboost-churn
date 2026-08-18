@@ -18,6 +18,7 @@ you today.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -76,10 +77,16 @@ def main():
     # that reads your CLI profile's default, which has no reason to match
     # where you actually want to train and, on this project's first run,
     # silently pointed a real CreateTrainingJob call at the wrong region's
-    # (also zero-quota) account limits. us-east-1 matches template.yaml /
-    # samconfig.toml.example / scripts/bootstrap_training_role.sh's default -
-    # override consistently across all three if you deploy elsewhere.
-    parser.add_argument("--region", default="us-east-1", help="Must match the region scripts/bootstrap_training_role.sh's policy was scoped to")
+    # (also zero-quota) account limits. Falls back to AWS_DEFAULT_REGION,
+    # then "us-east-1" - matching scripts/bootstrap_training_role.sh's
+    # fallback chain exactly (an earlier version of this fix only updated
+    # bootstrap_training_role.sh, leaving this script silently inconsistent
+    # with it - see docs/ARCHITECTURE.md#region-default-footgun).
+    parser.add_argument(
+        "--region",
+        default=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        help="Must match the region scripts/bootstrap_training_role.sh's policy was scoped to",
+    )
     parser.add_argument("--instance-type", default=DEFAULT_INSTANCE_TYPE)
     parser.add_argument("--xgboost-version", default=DEFAULT_XGBOOST_VERSION)
     parser.add_argument("--num-round", type=int, default=DEFAULT_NUM_ROUND)

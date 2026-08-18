@@ -52,6 +52,17 @@ Parameters:
       CORS origin allowed to call the predict API. Override to your actual
       demo page's origin before using this beyond local testing - see README.
 
+  ApiKeyValue:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >
+      Shared secret the predict Lambda requires in the X-Api-Key header.
+      HTTP APIs (unlike REST APIs) have no native API key/usage plan
+      feature - see docs/ARCHITECTURE.md#api-key-not-usage-plan for why this
+      is a hand-checked header instead. Generate one yourself, e.g.
+      `openssl rand -hex 24` - there is no default, deploy fails without one.
+
 Globals:
   Function:
     Runtime: python3.12
@@ -84,10 +95,19 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # Scoped to this project's own S3 key prefix, not the whole
+              # shared SageMaker default bucket ModelDataUrl's bucket name
+              # resolves to. CFN has no clean way to extract "everything
+              # after the bucket name" from an arbitrary-depth S3 URI
+              # parameter, so this pins to the literal prefix scripts/
+              # train.py always uploads/writes under (its S3_PREFIX
+              # constant) rather than deriving the exact single key -
+              # still covers every artifact this project produces, and
+              # nothing outside it.
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub
-                  - arn:aws:s3:::${Bucket}/*
+                  - arn:aws:s3:::${Bucket}/aws-sagemaker-xgboost-churn/*
                   - Bucket: !Select [2, !Split ['/', !Ref ModelDataUrl]]
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
@@ -131,7 +151,15 @@ Resources:
       CorsConfiguration:
         AllowOrigins: [!Ref AllowedOrigin]
         AllowMethods: [POST, OPTIONS]
-        AllowHeaders: [content-type]
+        AllowHeaders: [content-type, x-api-key]
+      # HTTP APIs have no native per-client usage plan / rate limit (that's
+      # REST-API-only - see docs/ARCHITECTURE.md#api-key-not-usage-plan).
+      # This is a blunt, account-wide throttle on the one route this API
+      # has, not per-client - it bounds worst-case sustained cost, it
+      # doesn't replace the X-Api-Key check below as the actual access gate.
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: 5
 
   PredictFunction:
     Type: AWS::Serverless::Function
@@ -142,6 +170,7 @@ Resources:
         Variables:
           ENDPOINT_NAME: !Sub ${AWS::StackName}-endpoint
           CHURN_THRESHOLD: !Ref ChurnThreshold
+          API_KEY_VALUE: !Ref ApiKeyValue
       Policies:
         - Statement:
             - Effect: Allow

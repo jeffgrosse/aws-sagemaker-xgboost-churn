@@ -14,6 +14,7 @@ numbers quoted in the README) and prints a summary table.
 
 import argparse
 import json
+import os
 import sys
 import tarfile
 import tempfile
@@ -22,6 +23,7 @@ from pathlib import Path
 import boto3
 import pandas as pd
 import xgboost as xgb
+from botocore.exceptions import ClientError
 from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +34,30 @@ TEST_CSV = REPO_ROOT / "data" / "processed" / "test.csv"
 TRAIN_CSV = REPO_ROOT / "data" / "processed" / "train.csv"
 LAST_RUN_PATH = REPO_ROOT / "data" / "last_training_run.json"
 METRICS_OUT = REPO_ROOT / "docs" / "evaluation-metrics.json"
+
+DEFAULT_THRESHOLD = 0.5
+
+
+def resolve_deployed_threshold(cfn_client, stack_name, fallback=DEFAULT_THRESHOLD):
+    """Reads the deployed stack's actual ChurnThreshold parameter, so the
+    metrics recorded here describe the model the live endpoint is really
+    running with rather than a threshold hardcoded separately here and
+    left to drift if someone deploys with a ChurnThreshold override.
+
+    Falls back to `fallback` if the stack doesn't exist yet - the normal
+    case for a first-time train -> evaluate -> deploy run, since evaluate.py
+    runs before any stack exists."""
+    try:
+        params = cfn_client.describe_stacks(StackName=stack_name)["Stacks"][0]["Parameters"]
+    except (ClientError, KeyError, IndexError):
+        print(f"Stack '{stack_name}' not found - using default threshold {fallback} "
+              "(deploy first, then re-run evaluate.py to score against the real deployed threshold).")
+        return fallback
+
+    for param in params:
+        if param["ParameterKey"] == "ChurnThreshold":
+            return float(param["ParameterValue"])
+    return fallback
 
 
 def majority_class(train_csv_path):
@@ -79,6 +105,13 @@ def download_and_load_model(model_data_url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-data-url", default=None, help="s3://.../model.tar.gz (defaults to data/last_training_run.json)")
+    parser.add_argument("--threshold", type=float, default=None, help="Classification threshold override; if omitted, reads ChurnThreshold from the deployed stack (falls back to 0.5 if not deployed yet)")
+    parser.add_argument("--stack-name", default="aws-sagemaker-xgboost-churn")
+    parser.add_argument(
+        "--region",
+        default=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        help="Region the stack is (or will be) deployed to - see docs/ARCHITECTURE.md#region-default-footgun",
+    )
     args = parser.parse_args()
 
     if not TEST_CSV.exists():
@@ -90,6 +123,13 @@ def main():
             sys.exit("No --model-data-url given and data/last_training_run.json not found - run scripts/train.py first.")
         model_data_url = json.loads(LAST_RUN_PATH.read_text())["model_data_url"]
 
+    if args.threshold is not None:
+        threshold = args.threshold
+    else:
+        cfn = boto3.client("cloudformation", region_name=args.region)
+        threshold = resolve_deployed_threshold(cfn, args.stack_name)
+    print(f"Classification threshold: {threshold}")
+
     test_df = pd.read_csv(TEST_CSV)
     X_test = test_df[FEATURE_COLUMNS].values
     y_test = test_df[TARGET_COLUMN].values
@@ -98,7 +138,7 @@ def main():
     booster = download_and_load_model(model_data_url)
 
     model_scores = booster.predict(xgb.DMatrix(X_test))
-    model_preds = (model_scores >= 0.5).astype(int)
+    model_preds = (model_scores >= threshold).astype(int)
     model_metrics = compute_metrics(y_test, model_preds, model_scores)
 
     baseline_class = majority_class(TRAIN_CSV)
@@ -109,6 +149,7 @@ def main():
     results = {
         "test_set_size": len(y_test),
         "test_set_churn_rate": round(float(y_test.mean()), 4),
+        "threshold": threshold,
         "model": model_metrics,
         "baseline": {"predicts": "No" if baseline_class == 0 else "Yes", **baseline_metrics},
     }
