@@ -173,6 +173,20 @@ a profile default is a reasonable convenience for ad hoc CLI use, and a
 real correctness hazard for a script other people will run against their
 own, differently-configured accounts.
 
+**A follow-up review caught that the first fix was itself inconsistent**:
+`bootstrap_training_role.sh` fell back to `AWS_DEFAULT_REGION` before
+`us-east-1`, but `train.py` and `invoke_endpoint.py`'s `--region` default
+was a static `"us-east-1"` with no environment-variable fallback at all -
+exporting `AWS_DEFAULT_REGION` (the standard AWS convention, and the exact
+variable this project's own CI sets) would have silently reproduced the
+same class of bug the fix was supposed to eliminate, just for two of the
+three scripts instead of all three. All three now read
+`os.environ.get("AWS_DEFAULT_REGION", "us-east-1")` / the bash
+equivalent identically. Still tracked as a follow-up: nothing in `tests/`
+exercises this fallback chain for any of the three scripts (see the
+README's Known follow-ups section), so a regression here wouldn't be
+caught by CI either.
+
 ## `cold-start-retry`
 
 Confirmed directly against the live endpoint: a request during a genuine
@@ -186,6 +200,45 @@ and retries once before giving up - every cold start hit while testing this
 resolved on the retry. `template.yaml`'s Lambda `Timeout` (20s) was raised
 from SAM's usual default specifically to leave room for this retry path
 without the Lambda itself timing out first.
+
+## `api-key-not-usage-plan`
+
+The predict API started with no authentication at all - open by design for
+a portfolio demo, but a review pass flagged it as unbounded exposure: a
+scripted client could hit `/predict` indefinitely with no owner-side rate
+limit, and each call is billed (SageMaker Serverless compute + Lambda). The
+natural fix looked like API Gateway's usual answer - an API key plus a
+usage plan - except that feature is **REST-API-only**. `AWS::Serverless::HttpApi`
+(what `PredictApi` is, and what this template deliberately used from the
+start for its lower cost/latency over `AWS::Serverless::Api`) has no API
+key or usage plan concept at all; that's a documented, permanent
+REST-vs-HTTP-API feature gap, not a configuration option to enable.
+
+Two options, given that constraint: migrate `PredictApi` to a REST API to
+get real API keys/usage plans, or keep the cheaper/simpler HTTP API and
+approximate the access control by hand. This template does the latter -
+a shared secret checked in `src/predict_lambda/app.py`'s `_authorized()`
+via `hmac.compare_digest` against an `ApiKeyValue` CFN parameter
+(`NoEcho: true`, no default), plus `DefaultRouteSettings` throttling
+(2 req/s, burst 5) on the HTTP API itself. This is deliberately not
+equivalent to REST API usage plans: the throttle is account-wide across
+all callers, not per-client, and the "key" is a single shared value with
+no rotation/revocation mechanism beyond redeploying with a new parameter
+value. For a low-traffic portfolio demo, that's judged sufficient - it
+stops a casual/accidental discovery-and-hammer scenario, which was the
+actual risk, without taking on a REST API migration's added complexity
+(different CORS config shape, different Lambda proxy integration
+version, more resources) for a threat model that doesn't need it.
+
+Practical implication: the `ApiKeyValue` parameter must be set at deploy
+time (`openssl rand -hex 24` is a reasonable way to generate one), and
+every caller - `curl`, `scripts/invoke_endpoint.py`, and a future demo
+page - must send it as `X-Api-Key`. `NoEcho` keeps it out of the
+CloudFormation console/change-set history, but it's still readable by
+anyone with `lambda:GetFunctionConfiguration` on the account once
+deployed (it's a Lambda environment variable, not a Secrets
+Manager/SSM-backed secret) - a fine trade-off for this project's threat
+model, worth knowing if you fork this for something with a higher bar.
 
 ## Cost model
 

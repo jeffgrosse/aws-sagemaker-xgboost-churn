@@ -107,8 +107,9 @@ train-then-deploy flow needs no manual copy-pasting between them.
 |---|---|---|
 | `ServerlessMemorySizeInMB` | `2048` | 1024–6144 MB, 1 GB increments |
 | `ServerlessMaxConcurrency` | `5` | max concurrent endpoint invocations |
-| `ChurnThreshold` | `0.5` | probability above which the API labels a customer "Yes" |
+| `ChurnThreshold` | `0.5` | probability above which the API labels a customer "Yes" - `scripts/evaluate.py` reads this back from the deployed stack, so the published metrics always describe the threshold that's actually live |
 | `AllowedOrigin` | `https://example.com` | CORS origin for the predict API - set before using beyond local testing |
+| `ApiKeyValue` | output of `openssl rand -hex 24` | required - the predict API rejects every request without a matching `X-Api-Key` header (see [Live demo](#live-demo)) |
 
 Answers are saved to `samconfig.toml` (gitignored - see
 `samconfig.toml.example` for the format).
@@ -143,9 +144,17 @@ real churners) - see
 
 ## Live demo
 
+Every request needs the `X-Api-Key` header set to the `ApiKeyValue` you
+deployed with - HTTP APIs (unlike REST APIs) have no built-in API key /
+usage plan feature, so this is a hand-checked shared secret plus a blunt
+account-wide throttle (2 req/s, burst 5), not a per-client quota. See
+[docs/ARCHITECTURE.md#api-key-not-usage-plan](docs/ARCHITECTURE.md#api-key-not-usage-plan)
+for why.
+
 ```bash
 curl -X POST https://YOUR-API-ID.execute-api.YOUR-REGION.amazonaws.com/predict \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: YOUR_API_KEY" \
   -d '{
     "SeniorCitizen": 0, "tenure": 2, "MonthlyCharges": 89.10, "TotalCharges": "178.20",
     "gender": "Female", "Partner": "No", "Dependents": "No", "PhoneService": "Yes",
@@ -163,8 +172,9 @@ two-year contract, DSL, low monthly charges) comes back at
 endpoint - the model is discriminating on real signal, not returning a
 constant.
 
-Or `python3 scripts/invoke_endpoint.py --stack-name aws-sagemaker-xgboost-churn`,
-which does the same thing and checks the response shape. Expect an
+Or `python3 scripts/invoke_endpoint.py --stack-name aws-sagemaker-xgboost-churn --api-key YOUR_API_KEY`
+(or set `PREDICT_API_KEY` instead of passing it every time), which does the
+same thing and checks the response shape. Expect an
 occasional cold start on the first request after a period of no traffic -
 normal, expected behavior for Serverless Inference, not a bug (the same
 latency trade-off already accepted by the Bedrock "ask your data" demo on
@@ -203,11 +213,11 @@ pip install -r requirements.txt && pip install -e .
 pytest tests/ -v
 ```
 
-28 tests: pure-logic coverage of feature encoding (`churn_features.py`),
+37 tests: pure-logic coverage of feature encoding (`churn_features.py`),
 training-job hyperparameter construction (`train.py`), evaluation metrics
-(`evaluate.py`), and the predict Lambda's request/response handling with a
-mocked `sagemaker-runtime` client - no AWS credentials or deployed stack
-required. `.github/workflows/ci.yml` runs this plus `sam validate --lint`
+and threshold resolution (`evaluate.py`), and the predict Lambda's
+request/response and API-key handling with a mocked `sagemaker-runtime`
+client - no AWS credentials or deployed stack required. `.github/workflows/ci.yml` runs this plus `sam validate --lint`
 and `sam build` on every push/PR - no training job, no `sam deploy`, zero
 AWS spend in CI. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for why a real training run
@@ -224,6 +234,60 @@ role) and clears local processed-data/build artifacts. The training
 execution role created by `make bootstrap-role` and the SageMaker default
 bucket's contents aren't touched - delete those manually
 (`aws iam delete-role`, `aws s3 rm`) if you want a fully clean account.
+
+## Known follow-ups
+
+Tracked from a Claude Code review pass (2026-08-18) against the merged
+initial pipeline. None of these block `v0.1.0` - they're real, verified
+findings judged low-severity enough to defer rather than gate the tag on:
+
+- **No test coverage for the region-defaulting fix**: `train.py`,
+  `invoke_endpoint.py`, and `bootstrap_training_role.sh`'s `--region` /
+  `AWS_DEFAULT_REGION` fallback chain is exercised by nothing in `tests/` -
+  a regression here (e.g. dropping the env-var fallback again) would ship
+  silently.
+- **`evaluate.py`'s `download_and_load_model` has no test coverage** for
+  the S3 download / tar extraction / model-loading path - only
+  `compute_metrics` and `majority_class` are tested.
+- **`download_and_load_model` brute-forces the model filename** with a
+  try-every-extracted-file loop under a blanket `except Exception`, when
+  the built-in XGBoost algorithm always writes the booster to one fixed
+  path (`xgboost-model` at the tarball root - see
+  [docs/ARCHITECTURE.md#xgboost-version-pin](docs/ARCHITECTURE.md#xgboost-version-pin)).
+  Loading that path directly would be simpler and wouldn't risk masking a
+  genuine failure behind a generic "tried every file" error.
+- **Cold-start retry timing is a guess, not a measured bound**: the 2s
+  delay in `src/predict_lambda/app.py` and the Lambda's 20s `Timeout` in
+  `template.yaml` are linked only by a comment, and no explicit
+  read/connect timeout is set on the `sagemaker-runtime` client - a slow
+  hang (rather than the fast `ModelError` actually observed) could still
+  blow past the Lambda's budget.
+- **Region default hardcoded independently in 4 places** (`train.py`,
+  `invoke_endpoint.py`, `bootstrap_training_role.sh`,
+  `samconfig.toml.example`) instead of one shared source of truth - the
+  structural reason the region-defaulting bug above was possible in the
+  first place.
+- **A full sample-customer literal is hand-maintained in 3 places**
+  (`scripts/invoke_endpoint.py`'s `SAMPLE_CUSTOMER`,
+  `tests/test_predict_lambda.py`'s `VALID_CUSTOMER`,
+  `tests/test_churn_features.py`'s `BASE_RECORD`) - a schema change could
+  update one or two and leave the third stale without anything failing
+  loudly.
+- **`prepare_data.py`'s `write_algorithm_csv` / `write_labeled_csv`**
+  duplicate the same concat/reset-index logic, differing only in whether a
+  header is written.
+- **`requirements.txt`'s header comment references a
+  `src/predict_lambda/requirements.txt` that doesn't exist** - harmless
+  (the Lambda only needs `boto3`, which ships with the runtime), but the
+  comment describes a file that was never created.
+- **`scripts/download_data.sh`'s row count uses `wc -l`**, which
+  undercounts by one if the downloaded CSV ever lacks a trailing newline -
+  would print a false "row count changed" warning on fully intact data.
+- **`src/predict_lambda/app.py`'s `event.get("body")` isn't guarded**
+  against `event` itself not being a dict (e.g. a manual invoke with a
+  null payload) - would raise an uncaught `AttributeError` instead of a
+  clean 400. Low real-world severity since API Gateway's HTTP API
+  integration always supplies a dict.
 
 ## Security / repo hygiene
 
