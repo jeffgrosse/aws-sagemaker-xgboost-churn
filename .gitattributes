@@ -1,0 +1,8 @@
+# notebooks/eda.ipynb is EDA-only (no production logic - verified: no
+# boto3/sagemaker/xgboost-training/lambda_handler references anywhere in
+# it). Its committed outputs include embedded base64 PNG chart images that
+# make up ~80% of the file's bytes, which is enough to make GitHub's
+# language stats report "Jupyter Notebook" as the repo's dominant
+# language even though every real line of logic lives in .py/.yaml files.
+# This excludes it from those stats without changing the notebook itself.
+notebooks/*.ipynb linguist-documentation
