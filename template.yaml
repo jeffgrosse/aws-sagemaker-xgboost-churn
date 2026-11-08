@@ -63,6 +63,14 @@ Parameters:
       is a hand-checked header instead. Generate one yourself, e.g.
       `openssl rand -hex 24` - there is no default, deploy fails without one.
 
+  AlarmEmail:
+    Type: String
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    Description: >
+      Email address subscribed to the predict API's 5xx alarm topic. AWS sends
+      a confirmation email on first deploy - alerts are only delivered after
+      the link in it is clicked. No default, so no address is committed here.
+
 Globals:
   Function:
     Runtime: python3.12
@@ -111,7 +119,15 @@ Resources:
                   - Bucket: !Select [2, !Split ['/', !Ref ModelDataUrl]]
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Endpoints/${AWS::StackName}-endpoint:*
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Endpoints/${AWS::StackName}-endpoint-v2:*
+              # From 2027-04-26 CloudWatch Logs only honours log-group-level
+              # actions (CreateLogGroup) on the log-group ARN itself, not on a
+              # trailing-:* stream ARN like the statement above - so grant it on
+              # the bare log-group ARN too. The statement above stays for the
+              # stream actions (CreateLogStream / PutLogEvents).
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/Endpoints/${AWS::StackName}-endpoint-v2
 
   SageMakerModel:
     Type: AWS::SageMaker::Model
@@ -132,13 +148,23 @@ Resources:
             MaxConcurrency: !Ref ServerlessMaxConcurrency
 
   # EndpointName is set explicitly (rather than left to CFN's generated
-  # physical ID) so the same value can be referenced by name in the Lambda's
-  # environment variable and in its IAM policy's Resource ARN below, without
-  # depending on AWS::SageMaker::Endpoint exposing it as a GetAtt attribute.
+  # physical ID) because SageMakerHostingExecutionRole's log-group ARNs above
+  # need it as a plain string - the role can't GetAtt the endpoint (endpoint
+  # -> config -> model -> role would be circular). Everything downstream of
+  # the endpoint (the Lambda's env var and IAM policy, the Outputs) reads it
+  # via GetAtt/Ref instead, so a rename only touches the !Sub strings here
+  # and in the role.
+  #
+  # "-v2": the original "<stack>-endpoint" was deleted outside CloudFormation
+  # (found missing 2026-11-08 while CFN still showed CREATE_COMPLETE). Changing
+  # EndpointName is a replacement, which is what gets CFN to create a fresh
+  # endpoint. Changing the logical ID instead and keeping the old name would
+  # NOT be safe: both logical resources would share one physical ARN, and the
+  # cleanup step's delete of the "old" one would delete the new endpoint.
   SageMakerEndpoint:
     Type: AWS::SageMaker::Endpoint
     Properties:
-      EndpointName: !Sub ${AWS::StackName}-endpoint
+      EndpointName: !Sub ${AWS::StackName}-endpoint-v2
       EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName
 
   # ---------------------------------------------------------------------------
@@ -168,14 +194,15 @@ Resources:
       Handler: predict_lambda.app.lambda_handler
       Environment:
         Variables:
-          ENDPOINT_NAME: !Sub ${AWS::StackName}-endpoint
+          ENDPOINT_NAME: !GetAtt SageMakerEndpoint.EndpointName
           CHURN_THRESHOLD: !Ref ChurnThreshold
           API_KEY_VALUE: !Ref ApiKeyValue
       Policies:
         - Statement:
             - Effect: Allow
               Action: sagemaker:InvokeEndpoint
-              Resource: !Sub arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${AWS::StackName}-endpoint
+              # Ref on AWS::SageMaker::Endpoint returns the endpoint ARN.
+              Resource: !Ref SageMakerEndpoint
       Events:
         PredictRoute:
           Type: HttpApi
@@ -183,7 +210,6 @@ Resources:
             ApiId: !Ref PredictApi
             Path: /predict
             Method: post
-    DependsOn: SageMakerEndpoint
 
   PredictFunctionLogGroup:
     Type: AWS::Logs::LogGroup
@@ -191,12 +217,49 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${PredictFunction}
       RetentionInDays: 90
 
+  # ---------------------------------------------------------------------------
+  # Alerting: any 5xx from the predict API -> SNS email
+  # ---------------------------------------------------------------------------
+
+  # On the API's 5xx metric, not the Lambda's Errors metric: app.py catches
+  # endpoint failures and returns a handled 502, which never counts as a Lambda
+  # Error. API Gateway's 5xx covers those 502s plus any unhandled Lambda crash
+  # or timeout.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  PredictApi5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Churn predict API returned at least one 5xx in 5 minutes (endpoint down, Lambda error, or timeout).
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref PredictApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # A quiet demo with no traffic publishes no datapoints - treat that as OK,
+      # not ALARM / INSUFFICIENT_DATA.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
 Outputs:
   PredictApiUrl:
     Description: Invoke URL for the predict endpoint (POST /predict).
     Value: !Sub https://${PredictApi}.execute-api.${AWS::Region}.amazonaws.com/predict
   EndpointName:
     Description: SageMaker Serverless Inference endpoint name.
-    Value: !Sub ${AWS::StackName}-endpoint
+    Value: !GetAtt SageMakerEndpoint.EndpointName
   ModelName:
     Value: !GetAtt SageMakerModel.ModelName

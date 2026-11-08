@@ -74,6 +74,11 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [\"logs:CreateLogGroup\", \"logs:CreateLogStream\", \"logs:PutLogEvents\"],
         \"Resource\": \"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/sagemaker/TrainingJobs:*\"
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": \"logs:CreateLogGroup\",
+        \"Resource\": \"arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:/aws/sagemaker/TrainingJobs\"
       }
     ]
   }" >/dev/null
