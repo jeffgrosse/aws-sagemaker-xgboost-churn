@@ -17,6 +17,8 @@ flowchart LR
         I --> J[Predict Lambda]
         J -->|invoke_endpoint| G
         G -.response.-> J -.-> I -.-> H
+        I -.5xx metric.-> K["CloudWatch alarm<br/>5xx ≥ 1 in 5 min"]
+        K -->|email| L([SNS topic])
     end
 ```
 
@@ -232,13 +234,52 @@ version, more resources) for a threat model that doesn't need it.
 
 Practical implication: the `ApiKeyValue` parameter must be set at deploy
 time (`openssl rand -hex 24` is a reasonable way to generate one), and
-every caller - `curl`, `scripts/invoke_endpoint.py`, and a future demo
-page - must send it as `X-Api-Key`. `NoEcho` keeps it out of the
+every caller - `curl`, `scripts/invoke_endpoint.py`, and the
+prediktsales.com demo page - must send it as `X-Api-Key`. `NoEcho` keeps it out of the
 CloudFormation console/change-set history, but it's still readable by
 anyone with `lambda:GetFunctionConfiguration` on the account once
 deployed (it's a Lambda environment variable, not a Secrets
 Manager/SSM-backed secret) - a fine trade-off for this project's threat
 model, worth knowing if you fork this for something with a higher bar.
+
+## `endpoint-deleted-outside-cfn`
+
+Found in production after `v0.1.0`, not while building: the Serverless
+Inference endpoint was deleted outside CloudFormation (CloudTrail's 90-day
+history had no record of who or when). The stack still listed
+`SageMakerEndpoint` as `CREATE_COMPLETE`, the Model and EndpointConfig were
+intact, and the predict Lambda logged `Endpoint ... not found` while
+returning 502s - and since those 502s are handled responses rather than
+Lambda errors, nothing alerted on them.
+
+A plain `sam deploy` can't repair this. CloudFormation only acts on
+differences between the old and new *template*; it doesn't re-check that
+resources still exist, so as far as it knew there was nothing to do.
+Changing a property that forces replacement makes it create a new one.
+For `AWS::SageMaker::Endpoint` that means `EndpointName` (changing
+`EndpointConfigName` is an in-place `UpdateEndpoint`, which would fail
+against an endpoint that doesn't exist). `v0.2.0` renames it from
+`<stack>-endpoint` to `<stack>-endpoint-v2`. The cleanup phase's delete of
+the "old" endpoint is then a harmless not-found.
+
+Changing the logical ID while keeping the old name looks equivalent but
+isn't safe: both logical resources would map to the same physical endpoint
+ARN, and the cleanup phase's delete of the "old" one would delete the new
+endpoint.
+
+The rename only touches the `!Sub` strings in `SageMakerEndpoint` and in
+`SageMakerHostingExecutionRole`'s log-group ARNs. The role can't reference
+the endpoint (endpoint -> config -> model -> role would be circular).
+Everything downstream reads the name via `!GetAtt SageMakerEndpoint.EndpointName`
+or the ARN via `!Ref SageMakerEndpoint`: the Lambda's `ENDPOINT_NAME`, its
+`sagemaker:InvokeEndpoint` policy, and the stack outputs.
+
+**What would have caught it:** CloudFormation drift detection.
+`aws cloudformation detect-stack-drift --stack-name <stack>` supports
+`AWS::SageMaker::Endpoint` and reports a resource deleted outside the stack
+as `DELETED`. The 5xx alarm added in the same release
+(see the README's Monitoring section) now catches the symptom from the
+API side as well.
 
 ## Cost model
 
