@@ -13,4 +13,6 @@ resolve_s3 = true
 # `openssl rand -hex 24`; every caller must send it back as X-Api-Key
 # (see docs/ARCHITECTURE.md#api-key-not-usage-plan for why this exists
 # instead of a real API Gateway usage plan).
-parameter_overrides = "ModelDataUrl=\"s3://REPLACE-ME/model.tar.gz\" ImageUri=\"REPLACE-ME.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1\" AllowedOrigin=\"https://example.com\" ApiKeyValue=\"REPLACE-ME-with-openssl-rand-hex-24\""
+# AlarmEmail has no default and is required - it receives the predict API's
+# 5xx alarm emails; confirm the SNS subscription email after first deploy.
+parameter_overrides = "ModelDataUrl=\"s3://REPLACE-ME/model.tar.gz\" ImageUri=\"REPLACE-ME.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1\" AllowedOrigin=\"https://example.com\" ApiKeyValue=\"REPLACE-ME-with-openssl-rand-hex-24\" AlarmEmail=\"you@example.com\""

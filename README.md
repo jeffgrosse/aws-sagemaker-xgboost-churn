@@ -8,9 +8,10 @@
 
 A SageMaker built-in XGBoost model, trained via a real (billed-per-second,
 self-terminating) training job, deployed behind a SageMaker Serverless
-Inference endpoint, and fronted by an API Gateway + Lambda predict API - all
-declaratively deployable with `sam deploy`, except the training job itself,
-which isn't a good fit for CloudFormation (see
+Inference endpoint, and fronted by an API Gateway + Lambda predict API, with
+a CloudWatch alarm that emails you (via SNS) when the API starts returning
+5xx errors - all declaratively deployable with `sam deploy`, except the
+training job itself, which isn't a good fit for CloudFormation (see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#cfn-vs-script-split)).
 
 ```mermaid
@@ -20,12 +21,14 @@ flowchart LR
     C --> D[(S3 model.tar.gz)]
     D --> E[Serverless Endpoint]
     F([Client]) -->|POST /predict| G[HTTP API] --> H[Lambda] -->|invoke_endpoint| E
+    G -.5xx.-> K[CloudWatch alarm] -->|email| L([SNS])
 ```
 
 ## Gotchas
 
-Four real ones hit while building this - each is documented in more detail,
-with a permanent anchor, in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Five real ones - four hit while building this, one found running it in
+production - each is documented in more detail, with a permanent anchor, in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 **Nothing in this repo trusts your CLI profile's default region - it cost real time to learn why.**
 `boto3.Session()` with no explicit region silently falls back to your AWS
@@ -63,6 +66,19 @@ time before your first `make train`. See
 (`tenure == 0`) who haven't been billed yet - `churn_features.py` treats
 that specific case as `$0` and raises on any other blank value. See
 [notebooks/eda.ipynb](notebooks/eda.ipynb) for where this was first spotted.
+
+**A resource deleted outside CloudFormation still looks healthy in the stack.**
+After `v0.1.0` the Serverless Inference endpoint was deleted outside
+CloudFormation. The stack kept reporting it as `CREATE_COMPLETE`, and the
+predict API quietly returned 502s, with nothing alerting on it. A plain
+`sam deploy` can't fix that: CloudFormation believes the endpoint still
+exists, so it has nothing to create. `v0.2.0` renames the endpoint to
+`<stack>-endpoint-v2`, which is a replacement, so CloudFormation creates a
+fresh one (and the new 5xx alarm covers the "nothing alerting" part).
+CloudFormation drift detection (`aws cloudformation detect-stack-drift`)
+would have caught it: it reports a resource deleted outside the stack as
+`DELETED`. See
+[docs/ARCHITECTURE.md#endpoint-deleted-outside-cfn](docs/ARCHITECTURE.md#endpoint-deleted-outside-cfn).
 
 ## Dataset
 
@@ -110,9 +126,14 @@ train-then-deploy flow needs no manual copy-pasting between them.
 | `ChurnThreshold` | `0.5` | probability above which the API labels a customer "Yes" - `scripts/evaluate.py` reads this back from the deployed stack, so the published metrics always describe the threshold that's actually live |
 | `AllowedOrigin` | `https://example.com` | CORS origin for the predict API - set before using beyond local testing |
 | `ApiKeyValue` | output of `openssl rand -hex 24` | required - the predict API rejects every request without a matching `X-Api-Key` header (see [Live demo](#live-demo)) |
+| `AlarmEmail` | `you@example.com` | required, no default - receives the predict API's 5xx alarm emails (see [Monitoring](#monitoring)) |
 
 Answers are saved to `samconfig.toml` (gitignored - see
 `samconfig.toml.example` for the format).
+
+After the first deploy, AWS emails a subscription confirmation to
+`AlarmEmail`. Alerts are only delivered once you click the link in it -
+until then the alarm still fires, but nobody hears about it.
 
 ## Evaluation
 
@@ -185,10 +206,31 @@ at all when it happened). `src/predict_lambda/app.py` retries once after a
 short delay specifically for that error before giving up, which is
 transparent to the caller in every case seen so far.
 
-A browsable demo page (same spirit as the Bedrock guardrails demo) is
-planned as a follow-up addition to prediktsales.com, calling this repo's
-deployed API directly - kept as a separate change so this repo stays fully
-self-contained and independently deployable in the meantime.
+A browsable demo page (same spirit as the Bedrock guardrails demo) is live
+at [prediktsales.com/retention.html](https://prediktsales.com/retention.html),
+calling this repo's deployed API directly. It lives in a separate repo, so
+this one stays fully self-contained and independently deployable.
+
+Because that page calls the API from the browser, its `X-Api-Key` value is
+visible to anyone who opens the page source. For the public demo the key is
+effectively public, and the account-wide throttle (2 req/s, burst 5) is the
+real cost bound - see
+[docs/ARCHITECTURE.md#api-key-not-usage-plan](docs/ARCHITECTURE.md#api-key-not-usage-plan).
+
+## Monitoring
+
+A CloudWatch alarm fires when the predict API returns at least one 5xx in a
+5-minute window, and emails `AlarmEmail` through an SNS topic (confirm the
+subscription first - see [Quickstart](#quickstart)). A quiet demo with no
+traffic publishes no datapoints; the alarm treats that as OK, not as an
+alarm or "insufficient data".
+
+It watches API Gateway's `5xx` metric, not the Lambda's `Errors` metric, on
+purpose: `src/predict_lambda/app.py` catches endpoint failures and returns a
+handled 502, which Lambda never counts as an error. An `Errors` alarm would
+have stayed silent through exactly the outage described under
+[Gotchas](#gotchas). API Gateway's `5xx` covers those handled 502s plus any
+unhandled Lambda crash or timeout.
 
 ## Cost estimate
 
@@ -201,6 +243,8 @@ Verified against current AWS pricing pages, not memory:
 | API Gateway (HTTP API) | $1.00/million requests | a few hundred/mo | ~$0.0005/mo |
 | Lambda | 1M requests/mo free tier | a few hundred/mo | $0 |
 | S3 (model artifact + training data) | standard storage | a few MB | ~$0.001/mo |
+| CloudWatch alarm (standard resolution) | $0.10/alarm metric/mo, first 10 free | 1 alarm | $0 within the free tier, else $0.10/mo |
+| SNS email notifications | first 1,000/mo free, then $2.00/100,000 | a handful of alerts | $0 |
 
 Nothing here bills hourly at zero traffic - no real-time endpoint, no
 notebook instance. `make clean` (`sam delete` + local artifact cleanup) is
@@ -230,16 +274,21 @@ make clean
 ```
 
 Runs `sam delete` (removes the endpoint, Lambda, API Gateway, IAM hosting
-role) and clears local processed-data/build artifacts. The training
-execution role created by `make bootstrap-role` and the SageMaker default
-bucket's contents aren't touched - delete those manually
-(`aws iam delete-role`, `aws s3 rm`) if you want a fully clean account.
+role, and the 5xx alarm with its SNS topic and email subscription) and
+clears local processed-data/build artifacts. The training execution role
+created by `make bootstrap-role` and the SageMaker default bucket's
+contents aren't touched - delete those manually (`aws iam delete-role`,
+`aws s3 rm`) if you want a fully clean account. Neither is the endpoint's
+log group, `/aws/sagemaker/Endpoints/<stack>-endpoint-v2`: SageMaker
+creates it, not CloudFormation, so delete it with
+`aws logs delete-log-group` if you want it gone.
 
 ## Known follow-ups
 
 Tracked from a Claude Code review pass (2026-08-18) against the merged
 initial pipeline. None of these block `v0.1.0` - they're real, verified
-findings judged low-severity enough to defer rather than gate the tag on:
+findings judged low-severity enough to defer rather than gate the tag on.
+All are still open as of `v0.2.0`:
 
 - **No test coverage for the region-defaulting fix**: `train.py`,
   `invoke_endpoint.py`, and `bootstrap_training_role.sh`'s `--region` /
@@ -302,7 +351,7 @@ contain a real S3 URI once you've trained) never leaves your machine.
 
 - [aws-bedrock-guardrails-sam](https://github.com/jeffgrosse/aws-bedrock-guardrails-sam) -
   same "standalone reference repo; live demo on prediktsales.com is a
-  separate, thinner integration" split as this repo's planned demo page.
+  separate, thinner integration" split as this repo's demo page.
 - [aws-serverless-lead-capture](https://github.com/jeffgrosse/aws-serverless-lead-capture) -
   same design philosophy (clarity over cleverness, fully parameterized SAM
   template) applied to a fully-CFN-native pattern.
